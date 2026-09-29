@@ -1,0 +1,9 @@
+[package]
+name = "yggdrasil-memory-layer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bincode = "1.3"
+java-diff-utils-rs = { path = "../java-diff-utils-rs" }
+sha2 = "0.10"

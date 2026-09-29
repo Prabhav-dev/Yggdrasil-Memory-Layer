@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "rust/java-diff-utils-rs",
+    "rust/memory-layer",
+]
+resolver = "2"
+
+[profile.test]
+opt-level = 2

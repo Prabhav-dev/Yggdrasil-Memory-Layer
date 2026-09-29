@@ -1,0 +1,125 @@
+use java_diff_utils_rs::diff_utils::DiffUtils;
+use java_diff_utils_rs::patch::Chunk;
+
+#[test]
+fn test_diff_insert() {
+    let source = vec!["hhh"];
+    let target = vec!["hhh", "jjj", "kkk"];
+
+    let patch = DiffUtils::diff(&source, &target, None);
+    let deltas = patch.deltas();
+
+    assert_eq!(deltas.len(), 1);
+    let delta = &deltas[0];
+
+    assert_eq!(delta.source(), &Chunk::new(1, vec![], None));
+    assert_eq!(delta.target(), &Chunk::new(1, vec!["jjj", "kkk"], None));
+}
+
+#[test]
+fn test_diff_delete() {
+    let source = vec!["ddd", "fff"];
+    let target = vec![];
+
+    let patch = DiffUtils::diff(&source, &target, None);
+    let deltas = patch.deltas();
+
+    assert_eq!(deltas.len(), 1);
+    let delta = &deltas[0];
+
+    assert_eq!(delta.source(), &Chunk::new(0, vec!["ddd", "fff"], None));
+    assert_eq!(delta.target(), &Chunk::new(0, vec![], None));
+}
+
+#[test]
+fn test_diff_change() {
+    let source = vec!["aaa", "bbb", "ccc"];
+    let target = vec!["aaa", "zzz", "ccc"];
+
+    let patch = DiffUtils::diff(&source, &target, None);
+    let deltas = patch.deltas();
+
+    assert_eq!(deltas.len(), 1);
+    let delta = &deltas[0];
+
+    assert_eq!(delta.source(), &Chunk::new(1, vec!["bbb"], None));
+    assert_eq!(delta.target(), &Chunk::new(1, vec!["zzz"], None));
+}
+
+#[test]
+fn test_diff_equal() {
+    let source = vec!["hhh", "jjj", "kkk"];
+    let target = vec!["hhh", "jjj", "kkk"];
+
+    let patch = DiffUtils::diff(&source, &target, None);
+    let deltas = patch.deltas();
+
+    assert_eq!(deltas.len(), 0);
+}
+
+#[test]
+fn test_diff_multiple_deltas() {
+    let source = vec!["hhh"];
+    let target = vec!["hhh", "jjj", "kkk"];
+
+    let patch = DiffUtils::diff(&source, &target, None);
+    let deltas = patch.deltas();
+
+    assert_eq!(deltas.len(), 1);
+
+    let delta0 = &deltas[0];
+    assert_eq!(delta0.source(), &Chunk::new(1, vec![], None));
+    assert_eq!(delta0.target(), &Chunk::new(1, vec!["jjj", "kkk"], None));
+}
+
+#[test]
+fn test_delta_type_names() {
+    let source = vec!["The", "dog", "is", "brown"];
+    let target = vec!["The", "fox", "is", "down"];
+
+    let patch = DiffUtils::diff(&source, &target, None);
+
+    let types: Vec<_> = patch.deltas().iter().map(|d| d.delta_type()).collect();
+
+    assert!(!types.is_empty());
+
+    let delta0 = &patch.deltas()[0];
+    assert_eq!(delta0.source(), &Chunk::new(1, vec!["dog"], None));
+    assert_eq!(delta0.target(), &Chunk::new(1, vec!["fox"], None));
+
+    let delta1 = &patch.deltas()[1];
+    assert_eq!(delta1.source(), &Chunk::new(3, vec!["brown"], None));
+    assert_eq!(delta1.target(), &Chunk::new(3, vec!["down"], None));
+}
+
+#[derive(Default)]
+struct TestListener {
+    started: bool,
+    ended: bool,
+    steps: Vec<(usize, usize)>,
+}
+
+impl java_diff_utils_rs::algorithm::diff_algorithm_listener::DiffAlgorithmListener for TestListener {
+    fn diff_start(&mut self) {
+        self.started = true;
+    }
+    fn diff_step(&mut self, value: usize, max: usize) {
+        self.steps.push((value, max));
+    }
+    fn diff_end(&mut self) {
+        self.ended = true;
+    }
+}
+
+#[test]
+fn test_diff_with_listener() {
+    let source = vec!["aaa", "bbb", "ccc"];
+    let target = vec!["aaa", "zzz", "ccc"];
+
+    let mut listener = TestListener::default();
+    let patch = DiffUtils::diff(&source, &target, Some(&mut listener));
+
+    assert!(listener.started, "listener.diff_start should have been called");
+    assert!(listener.ended, "listener.diff_end should have been called");
+    assert_eq!(patch.deltas().len(), 1);
+}

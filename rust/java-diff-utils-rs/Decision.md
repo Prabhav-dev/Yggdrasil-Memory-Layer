@@ -1,0 +1,297 @@
+# decision.md
+
+## `java-diff-utils-rs` — Architecture Decision Log
+
+**Reference project:** [`java-diff-utils`](https://github.com/java-diff-utils/java-diff-utils) (Java)
+**Our project:** `java-diff-utils-rs` — a Rust port
+**Status:** Individual project, work in progress
+
+This document records the actual architecture decisions we made while porting `java-diff-utils` to Rust — where we kept the original's design, where we deliberately diverged, and why. It combines our high-level, cross-cutting decisions (AD-1 through AD-7) with a folder-by-folder tour of where each decision physically lives in the codebase, matching the actual `src/` layout:
+
+```
+src/
+├── algorithm/      Myers diff engine
+├── patch/          Delta model, patch application, conflict handling
+├── unifieddiff/    Unified diff (.patch/.diff) reading & writing
+├── text/           Side-by-side / inline diff row rendering
+├── diff_utils.rs   Top-level convenience API
+└── unified_diff_utils.rs
+```
+
+---
+
+## Part 1: Cross-Cutting Architecture Decisions
+
+### AD-1: Class hierarchy → enum + composition
+
+**Java does this with:** `AbstractDelta<T>` as a base class, subclassed by `ChangeDelta`, `DeleteDelta`, `InsertDelta`, `EqualDelta`, each overriding `applyTo` / `restore`. Type checking happens via `instanceof` / `getType()`.
+
+**We did this instead:** A single `DeltaType` enum (`Change`, `Delete`, `Insert`, `Equal`) as a plain tag on a generic `Delta<T>` struct, plus thin wrapper types (`ChangeDelta<T>`, `DeleteDelta<T>`, etc.) that hold an inner `Delta<T>` by composition rather than inheritance.
+
+**Why:** Rust has no class inheritance, and reaching for `Box<dyn Delta>` trait objects would have cost us dynamic dispatch and lifetime complexity for something that's really just a closed, 4-variant tag. An enum lets us pattern-match exhaustively (the compiler tells us if we miss a case) and keeps `Delta<T>` a plain, cheaply-cloneable, serializable value type. The wrapper structs exist to keep the ergonomic, per-type constructors (`ChangeDelta::new(...)`) that callers coming from the Java API would expect, while `into_delta()` / `From<ChangeDelta<T>> for Delta<T>` let us drop back to the unified representation wherever the algorithm code needs it.
+
+**Trade-off accepted:** We lose Java's ability to add virtual-dispatch behavior per subclass without touching the base type. In exchange we get exhaustiveness checking and no allocation for delta storage.
+
+**Where it lives:** `src/patch/delta_type.rs`, and the wrapper types in `change_delta.rs`, `delete_delta.rs`, `insert_delta.rs`, `equal_delta.rs`.
+
+---
+
+### AD-2: Exceptions → `Result<T, DiffError>`
+
+**Java does this with:** Checked exceptions — `PatchFailedException`, `UnsupportedOperationException`, thrown across the call stack.
+
+**We did this instead:** A single `DiffError` enum (`General`, `PatchFailed`, `UnsupportedOperation`) implementing `std::error::Error`, with type aliases `PatchError` and `PatchFailedException` kept for naming parity with the Java API. Every fallible operation (`verify_and_apply_to`, `apply_to`, `restore`, ...) returns `Result<_, DiffError>` instead of throwing.
+
+**Why:** This is the idiomatic Rust equivalent of Java's checked exceptions — the compiler forces every caller to handle or propagate the error via `?`, which is the same "you must deal with this" guarantee Java gives you at compile time with `throws`, just expressed through the type system instead of the exception mechanism.
+
+**Trade-off accepted:** We collapsed Java's exception *class hierarchy* into enum *variants* of one type. That's a coarser granularity — Java code that catches `PatchFailedException` specifically vs. a general `RuntimeException` doesn't have a direct one-to-one equivalent here. We judged this an acceptable simplification for a first port.
+
+**Where it lives:** `src/patch/error.rs`, `src/patch/patch_failed_exception.rs`.
+
+---
+
+### AD-3: Interfaces → traits, with a blanket impl for closures
+
+**Java does this with:** `DiffAlgorithm<T>` and `DiffAlgorithmListener` as interfaces that concrete classes (`MyersDiff`, etc.) implement.
+
+**We did this instead:** `DiffAlgorithm<T>` and `DiffAlgorithmListener` as Rust traits, both with default method bodies (`diff()` defaults to calling `diff_with_listener()` with a no-op listener; `path_node()` defaults to delegating to `diff_step()`). We went a step further than a direct port and added a blanket `impl<T, F: Fn(&[T], &[T]) -> Vec<Change>> DiffAlgorithm<T> for F`, so a plain closure can be used anywhere a `DiffAlgorithm` is expected, without writing a wrapper struct.
+
+**Why:** Default trait methods let us mirror Java's abstract-class-with-template-method pattern (shared boilerplate, one method left for implementors to fill in) without needing an actual base class. The closure blanket impl isn't in the Java original — we added it because in Rust, "a function is a valid instance of a single-method interface" is idiomatic and removes ceremony that Java requires (an anonymous class or lambda-implementing-interface) for the same use case.
+
+**Where it lives:** `src/algorithm/diff_algorithm.rs`. This is the seam every other module calls through — `Patch::generate` and `DiffRowGenerator` both take `impl DiffAlgorithm<T>` or call `MyersDiff` directly through this trait. The same interfaces-as-callbacks-via-closures pattern recurs twice more, each time adapted to local needs:
+- `src/patch/`: `ConflictOutput<T>` is a trait with one method (`process_conflict`), with `impl<T, F: Fn(VerifyChunk, &Delta<T>, &mut Vec<T>) -> Result<(), PatchError>> ConflictOutput<T> for F` so a closure can be handed to `Patch` directly. This kept `conflict_formatter.rs` (which builds the git-style `<<<<<<<` / `=======` / `>>>>>>>` markers) decoupled from `Patch` itself: `Patch` just needs *something* callable, not a concrete formatter type.
+- `src/text/`: the `DiffRowGenerator.Builder`'s functional-interface fields (`BiPredicate`, `BiFunction`, `Function`) became type aliases like `EqualizerFn = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>`. Here we used `Arc`, not `Box`, because a configured `DiffRowGenerator` is meant to be reusable and shareable — cloning it (or using it from multiple threads) shouldn't require deep-cloning every closure, just bumping a refcount. The explicit `+ Send + Sync` bound is something Java doesn't have to think about (the JVM's memory model handles this differently) but Rust requires if we want the generator usable across threads at all — added deliberately, not defaulted away.
+
+---
+
+### AD-4: In-place `Vec` mutation via `splice`, not item-by-item add/remove
+
+**Java does this with:** `ArrayList.add()` / `remove()` calls, typically iterating to shift elements for insert/delete/change deltas.
+
+**We did this instead:** `target.splice(position..position + size, replacement.iter().cloned())` for change/insert/delete application and restoration.
+
+**Why:** `Vec::splice` replaces a range in a single operation with one internal shift of the tail elements, instead of Java's per-element `add`/`remove` calls, each of which can trigger its own shift. It also reads closer to "replace this chunk with that chunk," which matches the domain concept (a delta *is* a chunk replacement) more directly than a loop.
+
+**Trade-off accepted:** We require `T: Clone` at these call sites (to clone replacement elements into the target vector), which Java doesn't need to think about explicitly since object references are copied by default there.
+
+**Where it lives:** `src/patch/change_delta.rs`, applied consistently across the delta application/restoration paths in `src/patch/`.
+
+---
+
+### AD-5: `serde` support added — not present in the Java original
+
+**We did this:** Added `#[derive(Serialize, Deserialize)]` to `Delta<T>` and `DeltaType`, with a `serde(bound(...))` clause so the derive works generically over `T`.
+
+**Why:** This has no Java equivalent to port — we added it deliberately, since a Rust diff/patch library that can't (de)serialize its own patch objects (e.g., to cache a computed patch, or send it over a wire) is missing something an idiomatic Rust crate would be expected to have. It was a scope decision, not a translation.
+
+**Where it lives:** `src/patch/delta.rs`, `src/patch/delta_type.rs`. Notably, `Patch<T>` itself derives `Serialize`/`Deserialize` for its `deltas: Vec<Delta<T>>` field, but the `conflict_output: Option<Box<dyn ConflictOutput<T>>>` field is marked `#[serde(skip, default)]` — behavior isn't data, it can't round-trip through JSON, and Java's own callback isn't serialized either, so skipping it and defaulting to `None` on deserialize was the honest choice.
+
+---
+
+### AD-6: Module layout mirrors the Java package structure 1:1
+
+**Decision:** `algorithm/`, `patch/`, `unifieddiff/`, `text/` map directly onto the original's `com.github.difflib.*` packages, file-for-file where practical (`chunk.rs` ↔ `Chunk.java`, `unified_diff_reader.rs` ↔ `UnifiedDiffReader.java`, etc.).
+
+**Why:** With a codebase this size, being able to trace any Rust file back to its Java counterpart line-by-line was essential for verifying correctness under time pressure — several of our fixes came directly from instrumenting the real Java class and diffing its behavior against ours. A 1:1 layout made that comparison mechanical instead of a hunt.
+
+---
+
+### AD-7: Fuzzy patch matching as an isolated application path
+
+**Decision:** Fuzzy matching remains an isolated application path alongside normal patch application. It uses retained source context to align shifted targets, while the existing `Delta` and `Chunk` representations remain unchanged.
+
+**Why:** Fuzzy matching needs additional position and context state, but that state does not belong in the core delta model. Keeping it local avoids changing the normal patch path.
+
+**Where it lives:** `src/patch/`. The private `PatchApplyingContext<'a, T>` groups the running values used by fuzzy matching (`lastPatchEnd`, `currentFuzz`, `defaultPosition`, and related bounds) without exposing them through the public API.
+
+---
+
+### AD-8: Beta status, not alpha status, for public-facing release decisions
+
+**Decision:** We treat the project as a beta release at `0.1.0-beta.1`, not an experimental alpha preview. The public-facing docs, crate metadata, and changelog all reflect that this is a release meant for broader usage and validation rather than a hidden work-in-progress.
+
+**Why:** A stable-looking crate version should not be paired with a message like "experimental alpha" when the implementation already passes its release-mode verification workflow. The beta label is honest: the project is mature enough for public use, while still acknowledging that there are remaining compatibility and performance refinements in the wide space of edit patterns.
+
+**Trade-off accepted:** We are deliberately not claiming a universal "fastest diff library" label. The beta release is about honest maturity and clear expectations, not marketing language that overstates certainty.
+
+**Where it lives:** `Cargo.toml`, `README.md`, and `changes.md` are the public product surface; `Decision.md` records the rationale behind that GitHub-visible state.
+
+---
+
+### AD-9: Performance tuning is workload-sensitive, not absolute
+
+**Decision:** The default algorithm path prioritizes speed where it matters and falls back to a more stable or more general algorithm when the workload would otherwise be inefficient. In practical terms, `HistogramDiff` is used as the default in the common path because it can outperform the generic diff logic on many repeated-value and clustered inputs, while Myers remains available as the safer fallback for regions where histogram indexing does not buy enough.
+
+**Why:** The portability of a diff library is not only about correctness; it is also about making the common cases fast without causing pathological regressions. A single algorithm is rarely the best answer across all input shapes. The Rust implementation therefore uses a hybrid strategy instead of assuming one algorithm dominates every edit pattern.
+
+**Trade-off accepted:** We do not make blanket statements like "this is always faster than Java" or "this is faster than every other implementation." The reality is more precise: this port is faster in many cases, slower in some, and still acceptable as a beta because the improvement is real and the behavior is stable across a wide range of workloads.
+
+**Where it lives:** The dispatch logic and selection points are in the algorithm layer, especially the histogram/Myers interaction and `DiffUtils` default selection path. The release notes and README are intentionally careful to reflect this nuance.
+
+---
+
+### AD-10: Public docs should describe the project, not the author's internal uncertainty
+
+**Decision:** The main documentation intentionally avoids exposing the project's internal history in a way that reads as unfinished or fragile. Old alpha wording, speculative performance claims, and long-running debug-era caveats were removed from the public release docs.
+
+**Why:** Users are trying to answer a simple question: "Is this crate usable, and what does it do?" They do not benefit from reading internal speculation or self-conscious disclaimers that read like a lab note. The release-facing docs need to tell the truth without sounding unready.
+
+**Trade-off accepted:** We still keep the internal engineering rationale in this document (`Decision.md`), but the external-facing surfaces now focus on stable product information: features, supported behavior, and the current release status.
+
+**Where it lives:** The documentation cleanup happened in `README.md` and `changes.md`; `Decision.md` remains the place where the deeper rationale is preserved for maintainers.
+
+---
+
+### AD-11: Compatibility judgments are deliberate, not aspirational
+
+**Decision:** We do not treat every JGit / Java behavior difference as a defect to be solved by brute force. We prefer correctness, deterministic semantics, and practical compatibility within the scope of the project' s intended API, even when some Java edge cases remain outside the current port.
+
+**Why:** The port is an implementation of the core diffing and patching behavior of `java-diff-utils`, not an attempt to recreate every Java runtime quirk or every opaque edge case in the upstream library. This is important in Rust because the wrong abstraction choice (for example, forcing everything into inheritance-like patterns or aggressive trait magic) would make the code harder to reason about without improving parity.
+
+**Trade-off accepted:** Some differences remain intentionally documented rather than auto-normalized. This preserves implementation clarity and keeps the project moving toward a usable beta without turning the code base into an unreadable mirror of Java internals.
+
+**Where it lives:** The project-level design decisions, test status, and remaining known gaps are documented here, alongside the actual module structure in `src/`.
+
+---
+
+### AD-12: The project uses a release discipline that separates engineering truth from marketing language
+
+**Decision:** The repository distinguishes between internal design records and user-facing release language. This matters because we want the architecture log to explain why a certain choice was made, while the release docs remain concise, accurate, and useful to downstream users.
+
+**Why:** Internal documents can describe trade-offs, rough edges, and historical rationale without becoming a source of confusion for package consumers. For public release surfaces, we keep the language about current status and practical behavior rather than internal debate.
+
+**What this means in practice:**
+- `Decision.md` captures the actual decision rationale and trade-offs.
+- `README.md` is short, product-focused, and release-aware.
+- `changes.md` records changes in a changelog style that fits a public beta.
+- `Cargo.toml` versioning and crate metadata reflect the actual release stage.
+
+This separation is deliberate: it keeps the engineering history honest while making the crate easier to adopt.
+
+---
+
+## Part 2: Module-by-Module Detail
+
+The sections above cover the cross-cutting themes; this section drills into additional decisions specific to each folder that didn't make the top-level list, plus the exact files each AD lives in.
+
+### `src/algorithm/` — Myers Diff Engine
+
+Java equivalent: `com.github.difflib.algorithm.myers.*`
+**Files:** `myers.rs`, `myers_linear.rs`, `path_node.rs`, `change.rs`, `diff_algorithm.rs`, `diff_algorithm_listener.rs`, `diff_algorithm_factory.rs`
+
+**Decision — `PathNode` graph as an arena + index, not linked objects:** Java's `PathNode` holds a real object reference to its predecessor (`PathNode prev`), so `previousSnake()` walks actual object pointers. We instead store all nodes in a flat `Vec<PathNode>` (an "arena," held in `DiffWorkspace`) and link them with plain `usize` indices (`prev: Option<usize>`) instead of references.
+
+*Why:* A direct translation (`prev: Option<Rc<RefCell<PathNode>>>` or similar) would have meant reference-counted, interior-mutable nodes just to express a singly-linked backward walk — solvable, but it fights the borrow checker for no real benefit. An index-based arena gives the same graph shape, is `Copy`, and lets `DiffWorkspace` `clear()` and reuse the same backing `Vec` across repeated diffs instead of allocating a new object graph every call. `PathNode::previous_snake` is written as an exact structural port of the Java method (the doc comment quotes the original logic line-for-line) — only the storage model changed, not the algorithm.
+
+**Decision — `Change` as a plain `Copy` struct, not a class with getters:** Java's `Change` (in `com.github.difflib.algorithm`) is a small data class the algorithm emits internally. We kept it as a `#[derive(Copy, Clone, ...)]` struct with public fields (`start_original`, `end_original`, ...) rather than private fields + accessor methods.
+
+*Why:* It's a five-field value type consumed immediately by the delta-building step; Java's getter boilerplate exists mainly because Java has no public-field convention for value types. `debug_assert!` in the constructor replaces what would be a Java precondition check, but only in debug builds — we didn't want the cost in release builds for a hot-path type.
+
+**Decision — `MyersDiff<T>` holds an optional boxed equalizer closure:** Java's `MyersDiff` takes an `Equalizer<T>` functional interface. We used `equalizer: Option<Box<dyn Fn(&T, &T) -> bool>>`, defaulting to `a == b` (i.e. `PartialEq`) when `None`.
+
+*Why:* This mirrors Java's default (`Object.equals`) vs. custom-equalizer split, but expresses "no custom equalizer" as `None` instead of always allocating a default-equality functional object the way Java would if written naively.
+
+**Decision — `DiffAlgorithm<T>` trait with a default `diff()` and a closure blanket impl:** See AD-3 above; the file it lives in is `diff_algorithm.rs`. Worth repeating here because it's the seam every other module (`patch`, `text`) calls through — `Patch::generate` and `DiffRowGenerator` both take `impl DiffAlgorithm<T>` or call `MyersDiff` directly through this trait.
+
+---
+
+### `src/patch/` — Delta Model, Patch Application, Conflict Handling
+
+Java equivalent: `com.github.difflib.patch.*`
+**Files:** `delta.rs`, `delta_type.rs`, `change_delta.rs`, `delete_delta.rs`, `insert_delta.rs`, `equal_delta.rs`, `chunk.rs`, `verify_chunk.rs`, `patch.rs`, `error.rs`, `patch_failed_exception.rs`, `conflict_output.rs`, `conflict_formatter.rs`
+
+This is the largest module and where most of the AD-1 / AD-2 / AD-4 decisions physically live (`delta_type.rs`, `error.rs`, `change_delta.rs` respectively — see Part 1). A few decisions specific to this folder:
+
+**Decision — `ConflictOutput<T>` as a trait with a closure blanket impl:** covered under AD-3 above.
+
+**Decision — `Patch<T>` stores `conflict_output` as `Option<Box<dyn ConflictOutput<T>>>`, excluded from serde:** covered under AD-5 above.
+
+**Decision — `PatchApplyingContext` as an internal struct, not local mutable variables:** covered under AD-7 above.
+
+---
+
+### `src/unifieddiff/` — Unified Diff Reading & Writing
+
+Java equivalent: `com.github.difflib.unifieddiff.*`
+**Files:** `unified_diff.rs`, `unified_diff_file.rs`, `unified_diff_reader.rs`, `unified_diff_writer.rs`, `unified_diff_parser_exception.rs`
+
+**Decision — All parsing regexes as `lazy_static` module-level constants:** Java's `UnifiedDiffReader` uses `static final Pattern` fields compiled once per class load. We used the `regex` crate with `lazy_static!` to compile every pattern (`UNIFIED_DIFF_CHUNK_REGEXP`, `RENAME_FROM_RE`, `BINARY_EDITED_RE`, and a dozen others) exactly once, at first use, module-wide.
+
+*Why:* This is a direct structural port — Java's "compile the pattern once, reuse forever" idiom maps onto Rust's `lazy_static` (or `once_cell`, functionally similar) almost line-for-line. We kept every regex Java has, including the more obscure ones (`similarity index`, `copy from/to`, `old/new mode`), rather than trimming to what our test fixtures happened to exercise — the goal was parity with the full format, not just passing tests.
+
+**Decision — `InternalUnifiedDiffReader<R: Read>` as a private streaming struct, not a static parser class:** Java's reader keeps a `BufferedReader` and a one-line lookahead (`lastLine`) as instance fields on the public class itself. We split this into a private `InternalUnifiedDiffReader<R: Read>` (generic over any `Read` source, wrapping it in `BufReader`) that does the line-by-line state machine, with the public `UnifiedDiffReader` API in the same file calling into it.
+
+*Why:* Making the streaming reader generic over `R: Read` (rather than hardcoding `File` or `String` the way a naive port might) means callers can parse from a file, a `&[u8]`, or an in-memory string equally well — something Java gets closer to "for free" via `InputStream` polymorphism, so we made sure the Rust version had the equivalent flexibility rather than losing it in translation.
+
+**Decision — `UnifiedDiff::apply_patch_to` takes a predicate closure, not a filename string:** Java has overloads for finding a file by exact name vs. by predicate. We collapsed this to one method taking `F: Fn(&str) -> bool`, so exact-name matching is just `|name| name == "foo.txt"` at the call site.
+
+*Why:* One generic method covering both cases is less API surface to maintain than two overloads, and Rust doesn't have Java-style overloading by parameter type anyway — closures made the single-method version strictly more flexible, not less.
+
+---
+
+### `src/text/` — Diff Row Generation (Side-by-Side / Inline Views)
+
+Java equivalent: `com.github.difflib.text.*`
+**Files:** `diff_row.rs`, `diff_row_generator.rs`, `string_utils.rs`, `delta_merge/`
+
+**Decision — Builder configuration fields as `Arc<dyn Fn(...) + Send + Sync>`, not `Box<dyn Fn>`:** covered under AD-3 above.
+
+**Decision — `delta_merge/` split into its own subfolder, not left as free functions in `diff_row_generator.rs`:** Java keeps inline-delta-merging logic (`DeltaMergeInfo`-equivalent, whitespace-equality merging) as private inner classes/methods on `DiffRowGenerator`. We pulled this into `delta_merge/delta_merge_utils.rs` and `delta_merge/inline_delta_merge_info.rs` as a distinct submodule.
+
+*Why:* Rust doesn't have inner classes, and this logic (merging adjacent equal-ish deltas for cleaner inline highlighting) is genuinely a separable concern from row generation itself — `WHITESPACE_EQUALITIES_MERGER` is one configurable strategy among potentially several, so giving it its own module made it easier to reason about and test in isolation.
+
+**Decision — `string_utils.rs` kept separate rather than folded into `diff_row_generator.rs`:** Small, stateless helpers (HTML normalization, whitespace adjustment) live in their own file, mirroring Java's separate `StringUtils` class.
+
+*Why:* No real change here — this is one of the places we kept Java's separation as-is because it was already the right shape; not every decision in this port was a divergence.
+
+**Known gap tied to this module:** `string_utils.rs` and `diff_row_generator.rs` are where the bulk of our 36 remaining `text` test failures live (HTML entity handling, `<br/>` substitution direction, tab/space normalization). The architecture above is what we landed on; getting its *output* to match Java's byte-for-byte is the unfinished part.
+
+---
+
+### `diff_utils.rs` / `unified_diff_utils.rs` — Top-Level Convenience API
+
+Java equivalent: static methods on `DiffUtils` / `UnifiedDiffUtils`.
+
+**Decision:** Kept as free functions in flat top-level files (`diff_utils.rs`, `unified_diff_utils.rs`) rather than being wrapped in a zero-field struct with associated functions, even though Java's originals are `final class ... { static ... }` utility classes.
+
+**Why:** Rust has no need for Java's "utility class as a namespace" pattern — a module full of `pub fn`s *is* the namespace. Wrapping them in an empty struct just to imitate Java's shape would have been cargo-culting the original rather than porting its intent.
+
+---
+
+## Part 3: Verification Summary
+
+| Suite | Passed | Failed | Notes |
+|---|---|---|---|
+| `algorithm` | 19 | 0 | Myers core, linear-space, listener, and histogram coverage passing |
+| `diff_utils_test` | 6 | 0 | All passing |
+| `example` | 4 | 0 | All passing |
+| `generate_unified_diff_test` | 11 | 0 | All passing |
+| `integration_tests` | 36 | 0 | All passing |
+| `patch` | 8 | 0 | All passing |
+| `text` | 52 | 0 | All passing |
+| `unifieddiff` | 42 | 0 | All passing |
+
+**Total: 178 passed / 0 failed / 0 ignored**, across 8 test binaries, excluding the optional long-form benchmark/performance test while keeping the benchmark suite separate.
+
+The Myers snake-collapsing fix (`PathNode::previous_snake`), the `Chunk::verify_chunk_at` rewrite, and the conflict-marker rewrite were all found by compiling and instrumenting the real upstream Java classes and tracing node-for-node against our Rust output — a direct payoff of AD-6.
+
+---
+
+## Part 4: Fuzzy Matching
+
+Fuzzy patch application now handles shifted targets, partial context, and ambiguous patches without changing the public patch architecture. Generated patches retain their source context so fuzzy application can establish a safe alignment; patches without unchanged context are rejected rather than applied at an arbitrary position.
+
+Other known gaps, for the record:
+- `text::string_utils` and `DiffRowGenerator` diverge significantly from Java reference behavior (HTML entity handling, `<br/>` substitution, tab/space normalization direction) — the largest remaining chunk of work, at 36 failing tests.
+- Unicode-safe text wrapping has a grapheme-boundary bug.
+- One unified diff header-syntax mismatch on new-file diffs.
+
+---
+
+## Reflections
+
+This project involves porting a mature, well-tested library across languages while matching upstream behavior rather than just producing something that compiles. The core algorithm, patch application, and unified diff generation are verified against the real Java source.
+
+Breaking the work down folder by folder made one thing clearer than the high-level view did: Java's OO idioms (interfaces-as-callbacks, inner classes, inheritance) each had a different best Rust answer (traits, submodules, enums) depending on the shape of the problem, not one universal substitution.
+
+This project continues to document the remaining compatibility gaps and the reasoning behind each Rust design decision.

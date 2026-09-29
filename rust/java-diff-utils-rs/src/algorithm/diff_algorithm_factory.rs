@@ -1,0 +1,58 @@
+//! Factory interface and implementations for constructing diff algorithms.
+
+use super::{Change, DiffAlgorithm};
+
+/// Type alias for dynamic boxed equalizer predicates.
+pub type BoxedEqualizer<T> = Box<dyn Fn(&T, &T) -> bool + 'static>;
+
+pub trait DiffAlgorithmFactory<T> {
+    fn create(&self) -> Box<dyn DiffAlgorithm<T>>
+    where
+        T: PartialEq + 'static;
+
+    fn create_with_equalizer(&self, equalizer: BoxedEqualizer<T>) -> Box<dyn DiffAlgorithm<T>>
+    where
+        T: 'static;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MyersDiffFactory;
+
+impl<T: 'static> DiffAlgorithmFactory<T> for MyersDiffFactory {
+    fn create(&self) -> Box<dyn DiffAlgorithm<T>>
+    where
+        T: PartialEq + 'static,
+    {
+        Box::new(|source: &[T], target: &[T]| -> Vec<Change> {
+            super::myers::compute_diff(source, target)
+        })
+    }
+
+    fn create_with_equalizer(&self, equalizer: BoxedEqualizer<T>) -> Box<dyn DiffAlgorithm<T>> {
+        Box::new(move |source: &[T], target: &[T]| -> Vec<Change> {
+            super::myers::compute_diff_with(source, target, &*equalizer)
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MyersLinearDiffFactory;
+
+impl<T: PartialEq + 'static> DiffAlgorithmFactory<T> for MyersLinearDiffFactory {
+    fn create(&self) -> Box<dyn DiffAlgorithm<T>>
+    where
+        T: PartialEq + 'static,
+    {
+        Box::new(super::myers::myers_linear::MyersDiffWithLinearSpace::<T>::new())
+    }
+
+    fn create_with_equalizer(&self, equalizer: BoxedEqualizer<T>) -> Box<dyn DiffAlgorithm<T>> {
+        Box::new(
+            super::myers::myers_linear::MyersDiffWithLinearSpace::<T>::with_equalizer(
+                move |a: &T, b: &T| equalizer(a, b),
+            ),
+        )
+    }
+}
+
+pub use super::histogram::HistogramDiffFactory;

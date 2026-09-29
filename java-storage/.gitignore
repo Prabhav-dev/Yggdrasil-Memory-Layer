@@ -1,0 +1,24 @@
+# Java build output
+out/
+*.class
+
+# Generated runtime/test artifacts
+*.log
+*.tmp
+*.dat
+*.bin
+benchmark_data/
+btree_data/
+concurrency_test_data/
+memory_leak_test_data/
+tamper_test_data/
+tcp_test_data/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Local/temporary files
+*.swp
+*.swo
